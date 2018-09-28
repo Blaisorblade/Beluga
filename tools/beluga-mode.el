@@ -44,7 +44,7 @@
 (quail-define-package
  beluga-input-method-name ;; name
  "UTF-8"                  ;; language
- "\\"                     ;; mode-line "title"
+ "B"                      ;; mode-line "title"
  t                        ;; guidance
  "Beluga unicode input method: actually replaces keyword strings with
 a single unicode character instead of merely representing the keywords
@@ -128,8 +128,8 @@ in unicode using Font Lock mode."
     (define-key map "\C-c\C-c" 'compile)
     (define-key map "\C-c\C-l" 'beluga-highlight-holes)
     (define-key map "\C-c\C-e" 'beluga-erase-holes)
-    (define-key map "\C-c\C-x" 'beli-cmd)
-    (define-key map "\C-c\C-t" 'beli--type)
+    (define-key map "\C-c\C-x" 'beluga-run-command)
+    (define-key map "\C-c\C-t" 'beluga-get-type)
     (define-key map "\C-c\C-s" 'beluga-split-hole)
     (define-key map "\C-c\C-i" 'beluga-intro-hole)
     (define-key map "\C-c\C-j" 'beluga-hole-jump)
@@ -254,6 +254,14 @@ Regexp match data 0 points to the chars."
   "Contain the process running beli.")
 (make-variable-buffer-local 'beluga--proc)
 
+(defvar beluga--output-wait-time
+  0.025
+  "How long to wait for output from Beluga on each iteration.")
+
+(defvar beluga--output-timeout
+  1.0
+  "How long to wait in total for output before giving up.")
+
 (defun beluga--proc ()
   (unless (beluga--proc-live-p beluga--proc) (beluga-start))
   beluga--proc)
@@ -268,7 +276,6 @@ option. The process is put into a buffer called \"*beluga*\"."
            (make-comint "beluga"
 		                    beluga-interpreter-name
                         nil "-I" "-emacs" ))))
-  (message "started beluga interactive process")
   beluga--proc)
 
 (defun beluga-quit ()
@@ -348,10 +355,14 @@ option. The process is put into a buffer called \"*beluga*\"."
 
 (defun beluga--wait (proc)
   (assert (eq (current-buffer) (process-buffer proc)))
-  (while (and (progn
-                (goto-char comint-last-input-end)
-                (not (re-search-forward ".*;" nil t)))
-              (accept-process-output proc 0.025))))
+  (setq beluga--output-timer 0.0)
+  (while (progn
+           (goto-char comint-last-input-end)
+           (not (re-search-forward ".*?;" nil t)))
+    (accept-process-output proc beluga--output-wait-time)
+    (setq beluga--output-timer (+ beluga--output-timer beluga--output-wait-time))
+    (when (> beluga--output-timer beluga--output-timeout)
+      (error "Beluga command didn't produce complete output."))))
 
 (defun beluga--chomp (str)
   "Chomp leading and tailing whitespace from STR."
@@ -368,12 +379,12 @@ option. The process is put into a buffer called \"*beluga*\"."
   ; (interactive)
   (let ((proc (beluga--proc)))
     (with-current-buffer (process-buffer proc)
-      (beluga--wait proc)
       ;; We could also just use `process-send-string', but then we wouldn't
       ;; have the input text in the buffer to separate the various prompts.
       (goto-char (point-max))
       (insert (concat "%:" cmd))
-      (comint-send-input))))
+      (comint-send-input)
+      (beluga--wait proc))))
 
 (defun beluga--receive ()
   "Read the last output of beli."
@@ -410,9 +421,7 @@ The `visited-file-modtime' is compared to `beluga--last-load-time'.
 If the former is greater than the latter, then the former is
 returned. Else, `nil' is returned."
   (let ((mtime (visited-file-modtime)))
-    (message "Comparing times %s > %s ?" (current-time-string mtime) (current-time-string beluga--last-load-time))
     (when (> (float-time mtime) (float-time beluga--last-load-time))
-      (message "Need to reload!")
         mtime)))
 
 ;; ----- Beluga Interactive basic functions ----- ;;
@@ -509,7 +518,7 @@ returned. Else, `nil' is returned."
   (interactive)
   (beluga-start))
 
-(defun beli-cmd (cmd)
+(defun beluga-run-command (cmd)
   "Run a command in beli"
   (interactive "MCommand: ")
   (message "%s" (beluga--rpc cmd)))
@@ -984,46 +993,33 @@ starting position of the short pragma; else, nil."
   `(smie-rule-parent-p ,@parents))
 
 (defun beluga-smie-indent-rules (method token)
-  (message (format ">> indenting %s %s" method token))
-  (ignore-errors
-    (message (format "   parent is %s" (smie-indent--parent))))
   (pcase `(,method . ,token)
     (`(:elem . basic)
-     (message "<< basic indent")
      beluga-indent-basic)
 
     ; describe the tokens that introduce lists (with no separators)
     (`(:list-intro . ,(or ":" "fn" "fun" "FN" "mlam"))
-     (message "<< list intro form")
      't)
 
     ; if the token is a pipe preceded by an '=' or 'of', then we
     ; indent by adding the basic offset
     (`(:before . ,(and "|" (guard (smie-rule-prev-p "=" "of"))))
-     (message
-      (format
-       "<< pipe preceded by = or of with parent %s"
-       (smie-indent--parent)))
      beluga-indent-basic)
 
     ; if the token is a pipe, (and the preceding check didn't pass, so
     ; it isn't the first pipe in a sequence) then we consider it a
     ; separator
     (`(method . ,"|")
-     (message "<< pipe is a separator")
      (smie-rule-separator method))
 
     (`(:after . ,"of")
-     (message "<< after of")
      beluga-indent-basic)
 
     (`(:after . ,"in")
      (when (smie-rule-hanging-p)
-       (message "<< hanging in")
-       nil))
+       (smie-rule-parent)))
 
     (`(:after . ,(and "=" (guard (smie-rule-parent-p "rec"))))
-     (message "<< indent after = aligns to rec")
      (smie-rule-parent))
 
     ; if the token is a form that will use => eventually but is
@@ -1035,28 +1031,21 @@ starting position of the short pragma; else, nil."
        ,(and
          (or "case" "fn" "FN" "mlam" "fun")
          (guard `(smie-rule-prev-p ,@beluga-fat-arrows))))
-     (message "<< case fn FN mlam fun chain")
      (smie-rule-parent))
 
     (`(:after . ".")
-     (message "after .")
      (smie-rule-parent))
 
     (`(:after . ,(and ":" (guard (smie-rule-parent-p "{"))))
      (smie-rule-parent 1))
 
     (`(:after . ,(or ":" "let" "if"))
-     (message "<< : let if basic indent")
      (smie-rule-parent beluga-indent-basic))
 
     (`(:before
        .
        ,(and "=" (guard `(smie-rule-parent-p ,@beluga-type-declaration-keywords))))
-     (message (format "<< parent of = declares a datatype" (smie-indent--parent)))
      (smie-rule-parent))
-
-    ; do not indent anything else
-    (_ (message "<< nothing matched") nil)
     ))
 
 ;;---------------------------- Loading of the mode ----------------------------;;
